@@ -1,6 +1,5 @@
 FROM node:20-slim
 
-# Install LibreOffice (provides the soffice binary) and fonts for proper rendering
 RUN apt-get update && apt-get install -y \
     libreoffice \
     fonts-liberation \
@@ -13,6 +12,9 @@ COPY package*.json ./
 RUN npm ci --omit=dev
 
 COPY . .
+
+RUN chown -R node:node /app
+USER node
 
 EXPOSE 3100
 

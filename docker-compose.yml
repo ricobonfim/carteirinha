@@ -5,6 +5,6 @@ services:
       - "3100:3100"
     restart: unless-stopped
     environment:
-      # Change this to any strong token you want — then share the URL:
-      # http://your-server:3100/?token=YOUR_TOKEN_HERE
-      - ACCESS_TOKEN=anon-xK9mP2vL7nQ4rZ8wB3
+      # MUST provide a strong token, the application will crash if not set.
+      # Share the URL: http://your-server:3100/?token=YOUR_TOKEN_HERE
+      - ACCESS_TOKEN=${ACCESS_TOKEN:?ACCESS_TOKEN environment variable must be set!}

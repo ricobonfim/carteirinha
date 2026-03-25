@@ -3,8 +3,10 @@ const fs = require("fs");
 const path = require("path");
 const PizZip = require("pizzip");
 const libre = require("libreoffice-convert");
+const crypto = require("crypto");
+const helmet = require("helmet");
+const rateLimit = require("express-rate-limit");
 
-// Promisify libre.convert if convertAsync is not available
 const libreConvert = libre.convertAsync
   ? libre.convertAsync.bind(libre)
   : (buf, ext, filter) =>
@@ -14,36 +16,53 @@ const libreConvert = libre.convertAsync
         )
       );
 
-const ACCESS_TOKEN = process.env.ACCESS_TOKEN || "anon-xK9mP2vL7nQ4rZ8wB3";
-console.log("[auth] ACCESS_TOKEN loaded:", ACCESS_TOKEN ? "(set)" : "(MISSING)");
+const ACCESS_TOKEN = process.env.ACCESS_TOKEN;
+if (!ACCESS_TOKEN) {
+  console.error("FATAL ERROR: ACCESS_TOKEN environment variable is not set.");
+  process.exit(1);
+}
+console.log("[auth] ACCESS_TOKEN loaded (set)");
 
 const app = express();
-app.use(express.json());
 
-// Log every incoming request
+app.use(helmet());
+
+app.use(express.json({ limit: "500kb" }));
+
+const limiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 100,
+  message: "Too many requests from this IP, please try again later."
+});
+app.use(limiter);
+
 app.use((req, res, next) => {
   console.log(`[request] ${req.method} ${req.path} | token: ${req.query.token ? "(present)" : "(none)"}`);
   next();
 });
 
-// Block direct access to /index.html — must go through GET / for auth
 app.get("/index.html", (req, res) => {
   console.log("[auth] Blocked direct /index.html access");
   return res.status(401).send("Unauthorized");
 });
 
-// Serve static assets (css, js, etc.) freely, but NOT index.html
 app.use(express.static("public", { index: false }));
 
-// GET / — require ?token=... in the URL
+function safeCompare(a, b) {
+  if (typeof a !== 'string' || typeof b !== 'string') return false;
+  if (a.length !== b.length) return false;
+  return crypto.timingSafeEqual(Buffer.from(a), Buffer.from(b));
+}
+
 app.get("/", (req, res) => {
-  console.log("[auth] GET / | token query param:", req.query.token);
-  if (req.query.token !== ACCESS_TOKEN) {
+  console.log("[auth] GET / | token query param:", req.query.token ? "(present)" : "(none)");
+  
+  if (!safeCompare(req.query.token, ACCESS_TOKEN)) {
     console.log("[auth] Rejected: token mismatch or missing");
     return res.status(401).send("Unauthorized");
   }
+  
   console.log("[auth] Accepted: serving index.html");
-  // Inject the token into the page so the form can send it with POST /generate
   const html = fs.readFileSync(path.join("public", "index.html"), "utf8");
   const injected = html.replace(
     "</body>",
@@ -53,6 +72,7 @@ app.get("/", (req, res) => {
 });
 
 function formatName(name) {
+  if (!name) return "";
   return name
     .toLowerCase()
     .split(" ")
@@ -61,6 +81,7 @@ function formatName(name) {
 }
 
 function formatCPF(cpf) {
+  if (!cpf) return "";
   cpf = cpf.replace(/\D/g, ""); // remove non-digits
   cpf = cpf.padStart(11, "0"); // left pad
 
@@ -71,6 +92,7 @@ function formatCPF(cpf) {
 }
 
 function formatCEP(cep) {
+  if (!cep) return "";
   cep = cep.replace(/\D/g, "").padStart(8, "0");
   return cep.replace(/(\d{5})(\d{3})/, "$1-$2");
 }
@@ -94,14 +116,14 @@ function getExpireDate(short = false) {
 }
 
 app.post("/generate", async (req, res) => {
-  if (req.body.token !== ACCESS_TOKEN) {
+  if (!safeCompare(req.body.token, ACCESS_TOKEN)) {
     return res.status(401).send("Unauthorized");
   }
 
   try {
     let { fullName, cpf, rua, numero, complemento, bairro, cidade, cep } = req.body;
 
-    console.log("[generate] Raw input:", { fullName, cpf, rua, numero, complemento, bairro, cidade, cep });
+    console.log("[generate] Processing document generation request");
 
     fullName = formatName(fullName);
     cpf = formatCPF(cpf);
@@ -121,9 +143,7 @@ app.post("/generate", async (req, res) => {
     const shortExpireDate = getExpireDate(true);
     const now = new Date();
     const cyear = String(now.getFullYear());
-    const cmonth = String(now.getMonth() + 1); // no left-pad
-
-    console.log("[generate] Formatted input:", { fullName, cpf, address, cep, documentDate, expireDate, shortExpireDate, cyear, cmonth });
+    const cmonth = String(now.getMonth() + 1);
 
     const templatePath = path.resolve("template.odt");
     if (!fs.existsSync(templatePath)) {
@@ -132,7 +152,6 @@ app.post("/generate", async (req, res) => {
     }
 
     const content = fs.readFileSync(templatePath);
-    console.log("[generate] Template loaded, size:", content.length, "bytes");
 
     const data = {
       FULL_NAME_HERE: fullName,
@@ -146,34 +165,34 @@ app.post("/generate", async (req, res) => {
       CMONTH: cmonth,
     };
 
-    console.log("[generate] Replacing placeholders with data:", data);
-
-    // ODT files are ZIP archives; placeholders live in content.xml
     const zip = new PizZip(content);
     let xml = zip.file("content.xml").asText();
 
     for (const [key, value] of Object.entries(data)) {
-      // Escape XML special characters before injecting into XML
       const escaped = value
         .replace(/&/g, "&amp;")
         .replace(/</g, "&lt;")
-        .replace(/>/g, "&gt;");
+        .replace(/>/g, "&gt;")
+        .replace(/"/g, "&quot;")
+        .replace(/'/g, "&apos;");
       xml = xml.split(`{${key}}`).join(escaped);
     }
 
-    // Warn about any unreplaced placeholders still in the XML
     const unreplaced = Object.keys(data).filter(k => xml.includes(`{${k}}`));
     if (unreplaced.length > 0) {
-      console.warn("[generate] WARNING: These placeholders were NOT replaced (check your .odt uses {PLACEHOLDER} syntax):", unreplaced);
+      console.warn("[generate] WARNING: These placeholders were NOT replaced:", unreplaced);
     }
 
     zip.file("content.xml", xml);
     const buf = zip.generate({ type: "nodebuffer", compression: "DEFLATE" });
-    console.log("[generate] ODT buffer generated, size:", buf.length, "bytes");
 
     console.log("[generate] Converting ODT to PDF via LibreOffice...");
-    const pdfBuf = await libreConvert(buf, ".pdf", undefined);
-    console.log("[generate] PDF generated, size:", pdfBuf.length, "bytes");
+    
+    const conversionPromise = libreConvert(buf, ".pdf", undefined);
+    const timeoutPromise = new Promise((_, reject) =>
+      setTimeout(() => reject(new Error("LibreOffice conversion timed out")), 15000)
+    );
+    const pdfBuf = await Promise.race([conversionPromise, timeoutPromise]);
 
     if (!pdfBuf || pdfBuf.length === 0) {
       console.error("[generate] PDF buffer is empty after conversion");
@@ -183,9 +202,10 @@ app.post("/generate", async (req, res) => {
     res.setHeader("Content-Type", "application/pdf");
     res.setHeader("Content-Disposition", 'attachment; filename="document.pdf"');
     res.send(pdfBuf);
+    console.log("[generate] PDF successfully generated and sent");
 
   } catch (error) {
-    console.error("[generate] Error:", error);
+    console.error("[generate] Error:", error.message || error);
     res.status(500).send("Error generating document");
   }
 });
